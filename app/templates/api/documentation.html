@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PyOrchestrator API Documentation</title>
+    <link rel="icon" href="{{ url_for('static', filename='favicon-256x256.png') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <!-- Bootstrap 5 CSS from CDN -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+
+        <!-- Auto Detect Dark Mode -->
+        <script>
+            (function () {
+              const getPreferredTheme = () => {
+                if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                  return 'dark'
+                }
+                return 'light'
+              }
+        
+              document.documentElement.setAttribute('data-bs-theme', getPreferredTheme())
+            })();
+            </script>
+
+<style>
+    body {
+        margin: 2rem;
+        background-color: var(--bs-body-bg);
+        color: var(--bs-body-color);
+    }
+    pre, code {
+        background-color: var(--bs-tertiary-bg);
+        color: var(--bs-body-color);
+        padding: 1rem;
+        border-radius: 0.5rem;
+        overflow-x: auto;
+        font-family: monospace;
+    }
+    .badge-required {
+        background-color: #dc3545;
+    }
+    .badge-optional {
+        background-color: #0d6efd;
+    }
+</style>
+</head>
+<body class="container">
+
+    <header class="mb-5">
+        <h1 class="mt-4">📚 PyOrchestrator API Documentation</h1>
+        <p class="lead">This API allows trusted systems to create queue items for automation workflows.</p>
+    </header>
+
+    <section class="mb-5">
+        <h2>🔐 Authentication</h2>
+        <p>Every request must include the HTTP header:</p>
+        <pre><code>X-API-Key: your-api-key</code></pre>
+    </section>
+
+    <section class="mb-5">
+        <h2>🚀 Endpoints</h2>
+        <h4><span class="badge bg-success">POST</span> /api/queue</h4>
+        <p>Create a new queue item. All fields must be JSON formatted in the request body.</p>
+
+        <h5>Request Body Fields</h5>
+        <table class="table table-bordered table-hover">
+            <thead>
+                <tr>
+                    <th>Field</th>
+                    <th>Required?</th>
+                    <th>Description</th>
+                    <th>Default Behavior</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>queue_name</td>
+                    <td><span class="badge badge-required">Required</span></td>
+                    <td>Name of the queue to push to (max 100 characters)</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>status</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>Status of the queue item (NEW, IN_PROGRESS, DONE, FAILED, ABANDONED)</td>
+                    <td>Defaults to NEW</td>
+                </tr>
+                <tr>
+                    <td>data</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>
+                      Extra data related to the item (can be a string, object, or array).<br>
+                      If a JSON object or list is sent, it will be automatically stringified.<br>
+                      Maximum length after conversion: 2000 characters.
+                    </td>
+                    <td>Empty</td>
+                  </tr>                  
+                <tr>
+                    <td>reference</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>Reference number or external ID (max 100 characters)</td>
+                    <td>Empty</td>
+                </tr>
+                <tr>
+                    <td>created_by</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>User or system name that created the item (max 100 characters)</td>
+                    <td>Empty</td>
+                </tr>
+                <tr>
+                    <td>created_date</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>Creation timestamp (ISO8601 format)</td>
+                    <td>Defaults to server current time</td>
+                </tr>
+                <tr>
+                    <td>message</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>Human-readable message or notes</td>
+                    <td>Empty</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <section class="mb-5">
+        <h5>Example Request: /api/queue</h5>
+        <pre>
+    Headers:
+      Content-Type: application/json
+      X-API-Key: your-api-key
+    
+    Body:
+    {
+      "queue_name": "ExampleQueue",
+      "status": "NEW",
+      "data": {
+        "case_id": "123",
+        "case_number": "24-12345",
+        "sharepoint_folder": "Tilladelser"
+      },
+      "reference": "24-12345",
+      "created_by": "Robot",
+      "created_date": "2025-04-26T12:00:00",
+      "message": "Optional message"
+    }
+        </pre>
+    </section>
+    
+    <section class="mb-5">
+        <h4><span class="badge bg-success">POST</span> /api/trigger</h4>
+        <p>Update the status of a trigger (only triggers with type = SINGLE are supported).</p>
+    
+        <h5>Request Body Fields</h5>
+        <table class="table table-bordered table-hover">
+            <thead>
+                <tr>
+                    <th>Field</th>
+                    <th>Required?</th>
+                    <th>Description</th>
+                    <th>Default Behavior</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>trigger_name</td>
+                    <td><span class="badge badge-required">Required</span></td>
+                    <td>Name of the trigger to update (must exist and be of type SINGLE)</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>process_status</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>New status to assign to the trigger (e.g., IDLE, DONE, RUNNING)</td>
+                    <td>Defaults to IDLE</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+    
+    <section class="mb-5">
+        <h5>Example Request: /api/trigger</h5>
+        <pre>
+    Headers:
+      Content-Type: application/json
+      X-API-Key: your-api-key
+    
+    Body:
+    {
+      "trigger_name": "SingleTriggerName",
+      "process_status": "IDLE",
+    }
+        </pre>
+    </section>
+    
+    <section class="mb-5">
+        <h2>✅ Status Codes (All Endpoints)</h2>
+        <ul>
+            <li><b>201 Created</b> - Resource created successfully (for queue)</li>
+            <li><b>200 OK</b> - Trigger status updated successfully</li>
+            <li><b>400 Bad Request</b> - Validation failed (missing or malformed fields)</li>
+            <li><b>401 Unauthorized</b> - Missing or invalid API key</li>
+            <li><b>403 Forbidden</b> - Banned due to too many invalid attempts</li>
+            <li><b>404 Not Found</b> - Trigger not found or not of type SINGLE</li>
+            <li><b>429 Too Many Requests</b> - Rate limit exceeded</li>
+        </ul>
+    </section>
+    
+
+    <footer class="text-muted mt-5">
+        <p class="small">© 2025 MTM, Aarhus Kommune.</p>
+    </footer>
+
+    <!-- Bootstrap JS (Optional if you want dropdowns etc., can omit if just styling needed) -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
