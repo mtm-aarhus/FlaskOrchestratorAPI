@@ -193,6 +193,106 @@
     }
         </pre>
     </section>
+
+        <section class="mb-5">
+        <h4><span class="badge bg-success">GET</span> /vejmankassen</h4>
+        <p>Retrieve rows from the <code>VejmanKassen</code> table filtered by <code>FakturaStatus</code>.</p>
+
+        <h5>Request Body Fields</h5>
+        <table class="table table-bordered table-hover">
+            <thead>
+                <tr>
+                    <th>Field</th>
+                    <th>Required?</th>
+                    <th>Description</th>
+                    <th>Default Behavior</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>status</td>
+                    <td><span class="badge badge-required">Required</span></td>
+                    <td>Value of <code>FakturaStatus</code> to filter rows by</td>
+                    <td>-</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <section class="mb-5">
+        <h5>Example Request: /vejmankassen</h5>
+        <pre>
+    Headers:
+      Content-Type: application/json
+      X-API-Key: your-api-key
+
+    Body:
+    {
+      "status": "Ny"
+    }
+        </pre>
+    </section>
+
+    <section class="mb-5">
+        <h4><span class="badge bg-success">POST</span> /vejmankassen/update</h4>
+        <p>Update fields on a row in the <code>VejmanKassen</code> table using the row's <code>Id</code>.</p>
+
+        <h5>Request Body Fields</h5>
+        <table class="table table-bordered table-hover">
+            <thead>
+                <tr>
+                    <th>Field</th>
+                    <th>Required?</th>
+                    <th>Description</th>
+                    <th>Default Behavior</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>id</td>
+                    <td><span class="badge badge-required">Required</span></td>
+                    <td>ID of the row to update</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>fakturaStatus</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>New status value to set</td>
+                    <td>Unchanged</td>
+                </tr>
+                <tr>
+                    <td>kvadratmeter</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>Decimal area value to set</td>
+                    <td>Unchanged</td>
+                </tr>
+                <tr>
+                    <td>tilladelsestype</td>
+                    <td><span class="badge badge-optional">Optional</span></td>
+                    <td>Permit type to set</td>
+                    <td>Unchanged</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <section class="mb-5">
+        <h5>Example Request: /vejmankassen/update</h5>
+        <pre>
+    Headers:
+      Content-Type: application/json
+      X-API-Key: your-api-key
+
+    Body:
+    {
+      "id": 42,
+      "fakturaStatus": "Til fakturering",
+      "kvadratmeter": 25.5,
+      "tilladelsestype": "Henstilling Stillads m2"
+    }
+        </pre>
+    </section>
+
     
     <section class="mb-5">
         <h2>✅ Status Codes (All Endpoints)</h2>
