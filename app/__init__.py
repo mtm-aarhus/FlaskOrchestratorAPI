@@ -11,6 +11,10 @@ def create_app():
     app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('OpenOrchestratorSQL')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['API_KEY'] = os.getenv('PyOrchestratorAPIKey')
+    app.config['SQL_USER'] = os.getenv('SQL_USER')
+    app.config['SQL_PASSWORD'] = os.getenv('SQL_PASSWORD')
+    app.config['SQL_SERVER'] = os.getenv('SQL_SERVER')
+
 
     db.init_app(app)
 

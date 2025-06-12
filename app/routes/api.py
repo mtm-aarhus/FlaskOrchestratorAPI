@@ -9,7 +9,7 @@ from datetime import datetime
 import logging
 import time
 import json
-
+import pyodbc
 
 bp = Blueprint('api', __name__, url_prefix='/api')
 
@@ -18,6 +18,21 @@ limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["20 per minute"],  # General fallback
 )
+
+def get_connection():
+    conn_str = (
+        f"Driver={{ODBC Driver 17 for SQL Server}};"
+        f"Server=tcp:{current_app.config['SQL_SERVER']};"
+        f"Database=TilladelsesHistorik;"
+        f"Persist Security Info=False;"
+        f"UID={current_app.config['SQL_USER']};"
+        f"PWD={current_app.config['SQL_PASSWORD']};"
+        f"MultipleActiveResultSets=False;"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=no;"
+        f"Connection Timeout=30;"
+    )
+    return pyodbc.connect(conn_str)
 
 # Dynamic IP ban settings
 FAILED_ATTEMPTS = {}
@@ -230,3 +245,60 @@ def trigger_update():
         db.session.rollback()
         logging.error(f"Database error from {ip}: {str(e)}")
         return jsonify({"error": "Database error", "details": str(e)}), 500
+    
+
+@bp.route('/vejmankassen', methods=['GET'])
+@limiter.limit("60 per minute")
+def get_vejman_kassen_rows():
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    data = request.get_json()
+    if not data or "status" not in data:
+        return jsonify({"error": "Missing 'status' in request body"}), 400
+
+    status = data["status"]
+
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM VejmanKassen WHERE FakturaStatus = ?", status)
+            rows = [dict(zip([column[0] for column in cursor.description], row)) for row in cursor.fetchall()]
+            return jsonify(rows)
+    except Exception as e:
+        logging.exception("Failed to fetch data from VejmanKassen")
+        return jsonify({"error": "Internal Server Error"}), 500
+
+@bp.route('/vejmankassen/update', methods=['POST'])
+@limiter.limit("30 per minute")
+def update_vejman_kassen():
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json()
+    if not data or "id" not in data:
+        return jsonify({"error": "Missing 'id' field"}), 400
+
+    allowed_fields = {"fakturaStatus", "kvadratmeter", "tilladelsestype"}
+    updates = {k: v for k, v in data.items() if k in allowed_fields}
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            set_clause = ", ".join(f"{field} = ?" for field in updates)
+            values = list(updates.values())
+            values.append(data["id"])  # WHERE clause
+
+            query = f"UPDATE VejmanKassen SET {set_clause} WHERE Id = ?"
+            cursor.execute(query, values)
+            conn.commit()
+
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        logging.exception("Failed to update VejmanKassen")
+        return jsonify({"error": "Internal Server Error"}), 500

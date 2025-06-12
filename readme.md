@@ -106,6 +106,76 @@ X-API-Key: your-secret-key
 ```
 
 ---
+### GET /vejmankassen
+
+Fetch all rows from the `VejmanKassen` table filtered by `FakturaStatus`.
+
+**Required Header:**
+
+```
+X-API-Key: your-secret-key
+Content-Type: application/json
+```
+
+**Request Body:**
+
+```json
+{
+  "status": "Ny"
+}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "Id": 1,
+    "HenstillingId": "ABC123",
+    "FakturaStatus": "Ny",
+    "Adresse": "Example Street 1",
+    ...
+  },
+  ...
+]
+```
+
+---
+
+### POST /vejmankassen/update
+
+Update one or more fields on a specific row in the `VejmanKassen` table.
+
+**Required Header:**
+
+```
+X-API-Key: your-secret-key
+Content-Type: application/json
+```
+
+**Allowed Updatable Fields:**  
+- `fakturaStatus`
+- `kvadratmeter`
+- `tilladelsestype`
+
+**Request Body:**
+
+```json
+{
+  "id": 42,
+  "fakturaStatus": "Til fakturering",
+  "kvadratmeter": 25.5,
+  "tilladelsestype": "Henstilling Stillads m2"
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "success"
+}
+```
 
 ## ✅ Status Codes
 
