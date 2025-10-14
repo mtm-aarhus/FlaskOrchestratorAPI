@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, current_app, render_template
+from flask import Blueprint, request, jsonify, current_app, render_template, g, render_template, request
 from app import db
 from app.database import Queues, Triggers
 from flask_limiter import Limiter
@@ -9,9 +9,14 @@ from datetime import datetime
 import logging
 import time
 import json
-import pyodbc
+from azure.cosmos import CosmosClient
 
 bp = Blueprint('api', __name__, url_prefix='/api')
+
+# Create global variables (initialized in init_api)
+cosmos_client = None
+cosmos_database = None
+cosmos_container = None
 
 # Initialize Flask-Limiter
 limiter = Limiter(
@@ -19,20 +24,6 @@ limiter = Limiter(
     default_limits=["20 per minute"],  # General fallback
 )
 
-def get_connection():
-    conn_str = (
-        f"Driver={{ODBC Driver 17 for SQL Server}};"
-        f"Server=tcp:{current_app.config['SQL_SERVER']};"
-        f"Database=TilladelsesHistorik;"
-        f"Persist Security Info=False;"
-        f"UID={current_app.config['SQL_USER']};"
-        f"PWD={current_app.config['SQL_PASSWORD']};"
-        f"MultipleActiveResultSets=False;"
-        f"Encrypt=yes;"
-        f"TrustServerCertificate=no;"
-        f"Connection Timeout=30;"
-    )
-    return pyodbc.connect(conn_str)
 
 # Dynamic IP ban settings
 FAILED_ATTEMPTS = {}
@@ -57,9 +48,31 @@ def parse_datetime(dt_string):
 
 # Register blueprint and limiter in create_app
 def init_api(app):
+    global cosmos_client, cosmos_database, cosmos_container
+
     limiter.init_app(app)
     app.register_blueprint(bp)
+
+    # Initialize Cosmos client once for the whole app
+    cosmos_client = CosmosClient(
+        app.config["COSMOS_URL"],
+        credential=app.config["COSMOS_KEY"]
+    )
+    cosmos_database = cosmos_client.get_database_client(app.config["COSMOS_DB_NAME"])
+    cosmos_container = cosmos_database.get_container_client(app.config["COSMOS_CONTAINER"])
+
     
+def get_cosmos_container():
+    global cosmos_container
+    if cosmos_container is None:
+        cosmos_client = CosmosClient(
+            current_app.config["COSMOS_URL"],
+            credential=current_app.config["COSMOS_KEY"]
+        )
+        cosmos_database = cosmos_client.get_database_client(current_app.config["COSMOS_DB_NAME"])
+        cosmos_container = cosmos_database.get_container_client(current_app.config["COSMOS_CONTAINER"])
+    return cosmos_container
+
 @bp.route('/', methods=['GET'])
 def api_documentation():
     return render_template('api/documentation.html')
@@ -247,58 +260,96 @@ def trigger_update():
         return jsonify({"error": "Database error", "details": str(e)}), 500
     
 
-@bp.route('/vejmankassen', methods=['GET'])
+@bp.route('/tilsynapp', methods=['POST'])
 @limiter.limit("60 per minute")
 def get_vejman_kassen_rows():
     api_key = request.headers.get('X-API-Key')
     if not safe_compare(api_key, current_app.config['API_KEY']):
         return jsonify({"error": "Unauthorized"}), 401
-    
+
     data = request.get_json()
-    if not data or "status" not in data:
+    status = data.get("status")
+    container = get_cosmos_container()
+
+    if not status:
         return jsonify({"error": "Missing 'status' in request body"}), 400
 
-    status = data["status"]
-
     try:
-        with get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM VejmanKassen WHERE FakturaStatus = ?", status)
-            rows = [dict(zip([column[0] for column in cursor.description], row)) for row in cursor.fetchall()]
-            return jsonify(rows)
+        query = f"SELECT * FROM c WHERE c.FakturaStatus = @status ORDER BY c.Startdato DESC"
+        parameters = [{"name": "@status", "value": status}]
+        items = list(container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+        return jsonify(items)
     except Exception as e:
-        logging.exception("Failed to fetch data from VejmanKassen")
-        return jsonify({"error": "Internal Server Error"}), 500
+        current_app.logger.exception("Failed to fetch data from Cosmos")
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
 
-@bp.route('/vejmankassen/update', methods=['POST'])
+@bp.route('/tilsynapp/update', methods=['POST'])
 @limiter.limit("30 per minute")
 def update_vejman_kassen():
     api_key = request.headers.get('X-API-Key')
     if not safe_compare(api_key, current_app.config['API_KEY']):
         return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.get_json()
+    data = request.get_json(force=True)
     if not data or "id" not in data:
         return jsonify({"error": "Missing 'id' field"}), 400
 
-    allowed_fields = {"fakturaStatus", "kvadratmeter", "tilladelsestype"}
-    updates = {k: v for k, v in data.items() if k in allowed_fields}
+    #  Normalize field names from client (lowercase → Cosmos PascalCase)
+    key_map = {
+        "fakturaStatus": "FakturaStatus",
+        "kvadratmeter": "Kvadratmeter",
+        "tilladelsestype": "Tilladelsestype",
+        "slutdato": "Slutdato"
+    }
+
+    updates = {}
+    for k, v in data.items():
+        canonical = key_map.get(k)
+        if canonical:
+            updates[canonical] = v
+
     if not updates:
         return jsonify({"error": "No valid fields to update"}), 400
 
+    old_status = data.get("oldStatus")
+    new_status = updates.get("FakturaStatus", old_status)
+
+    container = get_cosmos_container()
+
     try:
-        with get_connection() as conn:
-            cursor = conn.cursor()
-            set_clause = ", ".join(f"{field} = ?" for field in updates)
-            values = list(updates.values())
-            values.append(data["id"])  # WHERE clause
+        # If FakturaStatus changed → must move across partitions
+        if old_status and new_status and old_status != new_status:
+            # Read old item from its partition
+            item = container.read_item(item=data["id"], partition_key=old_status)
 
-            query = f"UPDATE VejmanKassen SET {set_clause} WHERE Id = ?"
-            cursor.execute(query, values)
-            conn.commit()
+            # Apply all updates
+            item.update(updates)
+            item["FakturaStatus"] = new_status
 
-        return jsonify({"status": "success"}), 200
+            # Create new item under the new partition
+            container.create_item(body=item)
+
+            # Delete the old one
+            container.delete_item(item=data["id"], partition_key=old_status)
+
+            return jsonify({"status": "success", "moved": True}), 200
+
+        # Same-partition update → can patch directly
+        partition_key = old_status or new_status or "Ny"
+        patch_ops = [{"op": "replace", "path": f"/{k}", "value": v} for k, v in updates.items()]
+
+        container.patch_item(
+            item=data["id"],
+            partition_key=partition_key,
+            patch_operations=patch_ops
+        )
+
+        return jsonify({"status": "success", "moved": False}), 200
 
     except Exception as e:
-        logging.exception("Failed to update VejmanKassen")
-        return jsonify({"error": "Internal Server Error"}), 500
+        current_app.logger.exception("Failed to update Cosmos document")
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500

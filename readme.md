@@ -106,9 +106,9 @@ X-API-Key: your-secret-key
 ```
 
 ---
-### GET /vejmankassen
+### POST /tilsynapp
 
-Fetch all rows from the `VejmanKassen` table filtered by `FakturaStatus`.
+Fetch all rows from the `tilsynapp` table filtered by `FakturaStatus`.
 
 **Required Header:**
 
@@ -142,9 +142,9 @@ Content-Type: application/json
 
 ---
 
-### POST /vejmankassen/update
+### POST /tilsynapp/update
 
-Update one or more fields on a specific row in the `VejmanKassen` table.
+Update one or more fields on a specific row in the `tilsynapp` table.
 
 **Required Header:**
 

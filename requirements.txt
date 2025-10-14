@@ -6,3 +6,4 @@ pymssql == 2.3.2
 flask-limiter == 3.12
 waitress == 3.0.2
 SQLAlchemy == 2.0.40
+azure-cosmos == 4.*
