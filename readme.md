@@ -6,6 +6,7 @@ This is a secure internal API used to manage queue-based automation triggers.
 
 All endpoints require an `X-API-Key` header.
 Requests without a valid API key will be rejected with a `401 Unauthorized` error.
+File for auth is not submitted to github, that will be found on the hosted IIS platform.
 
 **Example header:**
 

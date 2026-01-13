@@ -298,19 +298,21 @@ def update_vejman_kassen():
     if not data or "id" not in data:
         return jsonify({"error": "Missing 'id' field"}), 400
 
-    #  Normalize field names from client (lowercase → Cosmos PascalCase)
+    user_email = data.get("userEmail")
+    if not user_email or "@" not in user_email:
+        return jsonify({"error": "Opdater din app"}), 426  # Upgrade Required
+    # Normalize field names
     key_map = {
         "fakturaStatus": "FakturaStatus",
         "kvadratmeter": "Kvadratmeter",
         "tilladelsestype": "Tilladelsestype",
-        "slutdato": "Slutdato"
+        "slutdato": "Slutdato",
     }
 
     updates = {}
     for k, v in data.items():
-        canonical = key_map.get(k)
-        if canonical:
-            updates[canonical] = v
+        if k in key_map:
+            updates[key_map[k]] = v
 
     if not updates:
         return jsonify({"error": "No valid fields to update"}), 400
@@ -320,36 +322,86 @@ def update_vejman_kassen():
 
     container = get_cosmos_container()
 
+    # Build audit entry
+    from datetime import datetime, timezone
+    audit_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user": user_email,
+        "changes": updates
+    }
+
     try:
-        # If FakturaStatus changed → must move across partitions
+        # ---------------------------------------------------
+        # 1. STATUS CHANGE → CROSS PARTITION MOVE
+        # ---------------------------------------------------
         if old_status and new_status and old_status != new_status:
-            # Read old item from its partition
+
+            # Read old document
             item = container.read_item(item=data["id"], partition_key=old_status)
 
-            # Apply all updates
+            # Audit log
+            item.setdefault("AuditLog", []).append(audit_entry)
+
+            # Apply updates + new status
             item.update(updates)
             item["FakturaStatus"] = new_status
 
-            # Create new item under the new partition
+            # Create in new partition
             container.create_item(body=item)
 
-            # Delete the old one
+            # Remove old
             container.delete_item(item=data["id"], partition_key=old_status)
 
             return jsonify({"status": "success", "moved": True}), 200
 
-        # Same-partition update → can patch directly
+        # ---------------------------------------------------
+        # 2. SAME PARTITION → PATCH ITEM
+        # ---------------------------------------------------
+        # --- Same partition: patch with audit update ---
         partition_key = old_status or new_status or "Ny"
-        patch_ops = [{"op": "replace", "path": f"/{k}", "value": v} for k, v in updates.items()]
 
+        # Read item first
+        item = container.read_item(item=data["id"], partition_key=partition_key)
+
+        # Build patch operations
+        patch_ops = []
+
+        # Add/replace updated fields
+        for k, v in updates.items():
+            op = "replace" if k in item else "add"
+            patch_ops.append({
+                "op": op,
+                "path": f"/{k}",
+                "value": v
+            })
+
+        # Always append audit log safely
+        audit_log = item.get("AuditLog", [])
+        audit_log.append(audit_entry)
+
+        # ALWAYS use "add", never replace
+        patch_ops.append({
+            "op": "add",
+            "path": "/AuditLog",
+            "value": audit_log
+        })
+
+        # Apply patch
         container.patch_item(
             item=data["id"],
             partition_key=partition_key,
             patch_operations=patch_ops
         )
-
         return jsonify({"status": "success", "moved": False}), 200
 
     except Exception as e:
         current_app.logger.exception("Failed to update Cosmos document")
         return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+
+@bp.route("/tilsynapp/version", methods=["GET"])
+def get_app_version_info():
+    return jsonify({
+        "min_version": 8,
+        "latest_version": 8,
+        "message": "Din app skal opdateres før du kan fortsætte. Gå ind i play store og søg efter nye opdateringer"
+    })
