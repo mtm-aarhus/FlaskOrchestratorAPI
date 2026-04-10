@@ -21,6 +21,11 @@ def create_app():
     app.config['COSMOS_KEY'] = os.getenv('COSMOS_KEY')
     app.config['COSMOS_DB_NAME'] = os.getenv('COSMOS_DB_NAME')
     app.config['COSMOS_CONTAINER'] = os.getenv('COSMOS_CONTAINER')
+    app.config['COSMOS_COMBINED_CONTAINER'] = os.getenv('COSMOS_COMBINED_CONTAINER')
+    app.config['COSMOS_VEJMAN_PERMISSIONS_CONTAINER'] = os.getenv('COSMOS_VEJMAN_PERMISSIONS_CONTAINER')
+    
+    app.config['AZURE_BLOB_CONNECTION'] = os.getenv('AZURE_BLOB_CONNECTION')
+
     db.init_app(app)
 
     with app.app_context():
@@ -28,7 +33,8 @@ def create_app():
         initialize_database()
 
     from app.routes import api
-    app.register_blueprint(api.bp)
+    api.init_api(app)  # This handles both setup and blueprint registration
+
     from app.routes import auth
     app.register_blueprint(auth.auth_bp)
 

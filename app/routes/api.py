@@ -1,22 +1,28 @@
-from flask import Blueprint, request, jsonify, current_app, render_template, g, render_template, request
+from flask import Blueprint, request, jsonify, current_app, render_template, render_template, request
 from app import db
 from app.database import Queues, Triggers
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import hmac
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import logging
 import time
 import json
 from azure.cosmos import CosmosClient
+from azure.storage.blob import BlobServiceClient
+import uuid
+import requests
 
 bp = Blueprint('api', __name__, url_prefix='/api')
 
-# Create global variables (initialized in init_api)
+# --- GLOBAL COSMOS CLIENTS ---
 cosmos_client = None
-cosmos_database = None
-cosmos_container = None
+cosmos_db = None
+container_henstillinger_old = None  # Partition Key: FakturaStatus
+container_unified = None            # Partition Key: /id
+blob_service_client = None
+
 
 # Initialize Flask-Limiter
 limiter = Limiter(
@@ -48,30 +54,33 @@ def parse_datetime(dt_string):
 
 # Register blueprint and limiter in create_app
 def init_api(app):
-    global cosmos_client, cosmos_database, cosmos_container
+    global cosmos_client, cosmos_db, container_henstillinger_old, container_unified, blob_service_client
 
     limiter.init_app(app)
     app.register_blueprint(bp)
 
-    # Initialize Cosmos client once for the whole app
     cosmos_client = CosmosClient(
-        app.config["COSMOS_URL"],
+    app.config["COSMOS_URL"],
         credential=app.config["COSMOS_KEY"]
     )
-    cosmos_database = cosmos_client.get_database_client(app.config["COSMOS_DB_NAME"])
-    cosmos_container = cosmos_database.get_container_client(app.config["COSMOS_CONTAINER"])
+    cosmos_db = cosmos_client.get_database_client(app.config["COSMOS_DB_NAME"])
 
+    # Old Legacy Henstillinger Container
+    container_henstillinger_old = cosmos_db.get_container_client(app.config["COSMOS_CONTAINER"])
+
+    # New Unified Container (Partition Key: /id)
+    container_unified = cosmos_db.get_container_client(app.config.get("COSMOS_COMBINED_CONTAINER"))
+     # Initialize Azure Blob Client
+    blob_service_client = BlobServiceClient.from_connection_string(app.config["AZURE_BLOB_CONNECTION"])
     
-def get_cosmos_container():
-    global cosmos_container
-    if cosmos_container is None:
-        cosmos_client = CosmosClient(
-            current_app.config["COSMOS_URL"],
-            credential=current_app.config["COSMOS_KEY"]
-        )
-        cosmos_database = cosmos_client.get_database_client(current_app.config["COSMOS_DB_NAME"])
-        cosmos_container = cosmos_database.get_container_client(current_app.config["COSMOS_CONTAINER"])
-    return cosmos_container
+def get_old_henstilling_container():
+    return container_henstillinger_old
+
+def get_unified_container():
+    return container_unified
+
+def get_blob_service_client():
+    return blob_service_client
 
 @bp.route('/', methods=['GET'])
 def api_documentation():
@@ -269,8 +278,7 @@ def get_vejman_kassen_rows():
 
     data = request.get_json()
     status = data.get("status")
-    container = get_cosmos_container()
-
+    container = get_old_henstilling_container()
     if not status:
         return jsonify({"error": "Missing 'status' in request body"}), 400
 
@@ -320,10 +328,9 @@ def update_vejman_kassen():
     old_status = data.get("oldStatus")
     new_status = updates.get("FakturaStatus", old_status)
 
-    container = get_cosmos_container()
+    container = get_old_henstilling_container()
 
     # Build audit entry
-    from datetime import datetime, timezone
     audit_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "user": user_email,
@@ -405,3 +412,199 @@ def get_app_version_info():
         "latest_version": 8,
         "message": "Din app skal opdateres før du kan fortsætte. Gå ind i play store og søg efter nye opdateringer"
     })
+
+
+def parse_iso_datetime(dt_string):
+    """
+    Parses an ISO 8601 string into a timezone-aware datetime object.
+    Handles 'Z' suffix and '+HH:MM' offsets correctly.
+    """
+    if not dt_string:
+        return None
+    try:
+        # Cosmos sometimes uses 'Z', fromisoformat expects '+00:00' in older 3.x versions
+        clean_dt = dt_string.replace('Z', '+00:00')
+        return datetime.fromisoformat(clean_dt)
+    except (ValueError, TypeError):
+        return None
+
+@bp.route('/tilsyn/tasks', methods=['GET', 'POST'])
+@limiter.limit("60 per minute")
+def get_unified_tasks():
+    # ... Auth check ...
+    
+    # Correct: Using the unified container client initialized at startup
+    container = get_unified_container()
+    
+    now = datetime.now().astimezone()
+    today_str = now.date().isoformat()
+
+    try:
+        # Fetch active permissions and 'Ny' henstillinger from TilsynItem
+        query = "SELECT * FROM c WHERE (c.type = 'permission') OR (c.type = 'henstilling' AND c.FakturaStatus = 'Ny')"
+        items = list(container.query_items(query=query, enable_cross_partition_query=True))
+
+        result = []
+        for item in items:
+            last_insp_str = item.get('last_inspected_at')
+            
+            if item.get('type') == 'henstilling':
+                # Henstilling: Simple daily logic
+                if not last_insp_str or not last_insp_str.startswith(today_str):
+                    result.append(item)
+            else:
+                # Permission: Reappearing logic based on end_date
+                if not last_insp_str:
+                    result.append(item)
+                    continue
+                
+                last_insp_dt = parse_iso_datetime(last_insp_str)
+                end_dt = parse_iso_datetime(item.get('end_date'))
+                
+                # 1. Show if not inspected today
+                if last_insp_dt and last_insp_dt.date() < now.date():
+                    result.append(item)
+                # 2. Reappear if it's past the end time today AND last inspection was before that end time
+                elif end_dt and end_dt.date() == now.date() and now >= end_dt:
+                    if last_insp_dt and last_insp_dt < end_dt:
+                        result.append(item)
+        
+        result.sort(key=lambda x: x.get('street_name') or x.get('Adresse') or "")
+        return jsonify(result), 200
+
+    except Exception as e:
+        current_app.logger.exception("Unified tasks failed")
+        return jsonify({"error": str(e)}), 500
+
+@bp.route('/tilsyn/history', methods=['GET', 'POST'])
+@limiter.limit("60 per minute")
+def get_unified_history():
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    container = get_unified_container()
+    try:
+        query = "SELECT * FROM c"
+        result = list(container.query_items(query=query, enable_cross_partition_query=True))
+        result.sort(key=lambda x: x.get('end_date') or x.get('Slutdato') or "", reverse=True)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@bp.route('/tilsyn/inspect', methods=['POST'])
+@limiter.limit("60 per minute")
+def unified_inspect():
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json(force=True)
+    item_id = data.get("id")
+    item_type = data.get("type")
+    user_email = data.get("inspector_email")
+    comment = data.get("comment")
+    inspected_at = data.get("inspected_at") or datetime.now(timezone.utc).isoformat()
+
+    if not item_id or not user_email:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    container = get_unified_container()
+    try:
+        item = container.read_item(item=item_id, partition_key=item_id)
+
+        item['last_inspected_at'] = inspected_at
+        item['last_inspector_email'] = user_email
+        item['inspection_comment'] = comment
+
+        # Maintain History
+        if 'inspections' not in item or not isinstance(item['inspections'], list):
+            item['inspections'] = []
+        
+        item['inspections'].append({
+            "inspected_at": inspected_at,
+            "inspector_email": user_email,
+            "comment": comment
+        })
+
+        if item_type == "henstilling":
+            updates = data.get("updates", {})
+            if "kvadratmeter" in updates: item["Kvadratmeter"] = updates["kvadratmeter"]
+            if "slutdato" in updates: item["Slutdato"] = updates["slutdato"]
+            if "fakturaStatus" in updates: item["FakturaStatus"] = updates["fakturaStatus"]
+            
+            item.setdefault("AuditLog", []).append({
+                "timestamp": inspected_at, "user": user_email, "changes": updates
+            })
+
+        container.replace_item(item=item_id, body=item, if_match=item.get('_etag'))
+
+        queue_payload = {
+            "queue_name": "TilsynJournal",
+            "reference": item_id,
+            "data": data,  # Includes selection, comment, id, etc.
+            "created_by": user_email
+        }
+        
+        requests.post(
+            f"{request.host_url.rstrip('/')}/api/queue",
+            json=queue_payload,
+            headers={"X-API-Key": request.headers.get('X-API-Key')},
+            timeout=5
+        )
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        current_app.logger.exception(f"Unified inspect failed for {item_id}")
+        return jsonify({"error": str(e)}), 500
+
+@bp.route('/tilsyn/upload-image', methods=['POST'])
+@limiter.limit("100 per minute")
+def upload_tilsyn_image():
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if 'image' not in request.files:
+        return jsonify({"error": "No image provided"}), 400
+    
+    image_file = request.files['image']
+    item_id = request.form.get('id')
+    # Get the readable filename from the Android app (e.g. 20240520_143005_123.jpg)
+    custom_filename = request.form.get('filename')
+    
+    try:
+        # Use custom filename if provided, otherwise fallback to UUID
+        file_part = custom_filename if custom_filename else f"{uuid.uuid4()}.jpg"
+        blob_name = f"{item_id}/{file_part}"
+        
+        # 1. Upload to Azure
+        blob_client = get_blob_service_client().get_blob_client(
+            container="tilsyn-uploads", 
+            blob=blob_name
+        )
+        blob_client.upload_blob(image_file.read(), overwrite=True)
+
+        # 2. Call the queue endpoint
+        queue_payload = {
+            "queue_name": "TilsynBilleder",
+            "reference": item_id,
+            "data": {
+                "tilsyn_id": item_id,
+                "blob_path": blob_name,
+                "filename": file_part # This is the readable name for the robot/journal
+            },
+            "created_by": "TilsynsApp"
+        }
+        
+        requests.post(
+            f"{request.host_url.rstrip('/')}/api/queue", 
+            json=queue_payload,
+            headers={"X-API-Key": api_key},
+            timeout=5
+        )
+
+        return jsonify({"status": "success", "blob": blob_name}), 200
+
+    except Exception as e:
+        current_app.logger.exception("Upload failed")
+        return jsonify({"error": str(e)}), 500
