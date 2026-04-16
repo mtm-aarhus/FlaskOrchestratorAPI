@@ -10,6 +10,7 @@ import logging
 import time
 import json
 from azure.cosmos import CosmosClient
+from azure.cosmos.exceptions import CosmosHttpResponseError
 from azure.storage.blob import BlobServiceClient
 import uuid
 import requests
@@ -414,84 +415,133 @@ def get_app_version_info():
     })
 
 
-def parse_iso_datetime(dt_string):
-    """
-    Parses an ISO 8601 string into a timezone-aware datetime object.
-    Handles 'Z' suffix and '+HH:MM' offsets correctly.
-    """
-    if not dt_string:
+def parse_iso_datetime(dt_str):
+    if not dt_str:
         return None
     try:
-        # Cosmos sometimes uses 'Z', fromisoformat expects '+00:00' in older 3.x versions
-        clean_dt = dt_string.replace('Z', '+00:00')
-        return datetime.fromisoformat(clean_dt)
-    except (ValueError, TypeError):
+        # No timezone handling. Just parse and remove tzinfo if present.
+        dt = datetime.fromisoformat(str(dt_str).replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None)
+    except Exception:
         return None
 
-@bp.route('/tilsyn/tasks', methods=['GET', 'POST'])
+@bp.route('/tilsyn/tasks', methods=['GET'])
 @limiter.limit("60 per minute")
 def get_unified_tasks():
-    # ... Auth check ...
-    
-    # Correct: Using the unified container client initialized at startup
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
     container = get_unified_container()
-    
-    now = datetime.now().astimezone()
+    now = datetime.now()
     today_str = now.date().isoformat()
 
     try:
-        # Fetch active permissions and 'Ny' henstillinger from TilsynItem
-        query = "SELECT * FROM c WHERE (c.type = 'permission') OR (c.type = 'henstilling' AND c.FakturaStatus = 'Ny')"
+        # 1. Fetch potentially active items (not explicitly hidden or finished)
+        query = """
+            SELECT * FROM c
+            WHERE (c.hidden != true OR NOT IS_DEFINED(c.hidden))
+            AND (
+                c.type = 'permission'
+                OR
+                (c.type = 'henstilling' AND c.FakturaStatus = 'Ny')
+                OR
+                c.type = 'indmeldt'
+            )
+        """
         items = list(container.query_items(query=query, enable_cross_partition_query=True))
 
         result = []
+
         for item in items:
-            last_insp_str = item.get('last_inspected_at')
-            
-            if item.get('type') == 'henstilling':
-                # Henstilling: Simple daily logic
-                if not last_insp_str or not last_insp_str.startswith(today_str):
+            item_type = item.get("type")
+            last_insp_str = item.get("last_inspected_at")
+            last_insp_dt = parse_iso_datetime(last_insp_str)
+
+            if item_type == "henstilling":
+                # Only show if it hasn't been inspected yet today
+                if not last_insp_str or not str(last_insp_str).startswith(today_str):
                     result.append(item)
-            else:
-                # Permission: Reappearing logic based on end_date
-                if not last_insp_str:
+
+            elif item_type == "indmeldt":
+                # Show until first inspection is registered
+                if not last_insp_dt:
                     result.append(item)
+
+            elif item_type == "permission":
+                start_dt = parse_iso_datetime(item.get("start_date"))
+                end_dt = parse_iso_datetime(item.get("end_date"))
+
+                if not start_dt or not end_dt:
                     continue
-                
-                last_insp_dt = parse_iso_datetime(last_insp_str)
-                end_dt = parse_iso_datetime(item.get('end_date'))
-                
-                # 1. Show if not inspected today
-                if last_insp_dt and last_insp_dt.date() < now.date():
-                    result.append(item)
-                # 2. Reappear if it's past the end time today AND last inspection was before that end time
-                elif end_dt and end_dt.date() == now.date() and now >= end_dt:
-                    if last_insp_dt and last_insp_dt < end_dt:
+
+                # CASE A: Currently active permission
+                if start_dt <= now <= end_dt:
+                    item["vejman_display_state"] = "Ny tilladelse"
+                    # Show if not inspected today
+                    if not (last_insp_dt and last_insp_dt.date() == now.date()):
                         result.append(item)
-        
-        result.sort(key=lambda x: x.get('street_name') or x.get('Adresse') or "")
+
+                # CASE B: Expired permission (needs a final check)
+                elif now > end_dt:
+                    item["vejman_display_state"] = "Færdig tilladelse"
+                    # Show if it hasn't been inspected since it actually expired
+                    if not (last_insp_dt and last_insp_dt > end_dt):
+                        result.append(item)
+
+        # Sort by street name, then full address for better grouping on the device
+        result.sort(key=lambda x: (
+            (x.get("street_name") or "").strip().lower(),
+            (x.get("full_address") or "").strip().lower(),
+        ))
+
         return jsonify(result), 200
 
     except Exception as e:
         current_app.logger.exception("Unified tasks failed")
         return jsonify({"error": str(e)}), 500
 
-@bp.route('/tilsyn/history', methods=['GET', 'POST'])
-@limiter.limit("60 per minute")
+@bp.route('/tilsyn/history', methods=['GET'])
 def get_unified_history():
     api_key = request.headers.get('X-API-Key')
     if not safe_compare(api_key, current_app.config['API_KEY']):
         return jsonify({"error": "Unauthorized"}), 401
-
     container = get_unified_container()
-    try:
-        query = "SELECT * FROM c"
-        result = list(container.query_items(query=query, enable_cross_partition_query=True))
-        result.sort(key=lambda x: x.get('end_date') or x.get('Slutdato') or "", reverse=True)
-        return jsonify(result), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    now = datetime.now()
 
+
+    try:
+        # 1. Fetch everything that has a history or is marked as done/hidden
+        query = """
+            SELECT * FROM c
+            WHERE (IS_ARRAY(c.inspections) AND ARRAY_LENGTH(c.inspections) > 0)
+               OR c.hidden = true
+               OR c.FakturaStatus = 'Fakturer ikke'
+               OR c.FakturaStatus = 'Til fakturering'
+               OR c.FakturaStatus = 'Faktureret'
+        """
+        items = list(container.query_items(query=query, enable_cross_partition_query=True))
+
+        for item in items:
+            # Add status labels to permissions in history
+            if item.get("type") == "permission":
+                start_dt = parse_iso_datetime(item.get("start_date"))
+                end_dt = parse_iso_datetime(item.get("end_date"))
+
+                if start_dt and end_dt:
+                    if start_dt <= now <= end_dt:
+                        item["vejman_display_state"] = "Ny tilladelse"
+                    elif now > end_dt:
+                        item["vejman_display_state"] = "Færdig tilladelse"
+
+        # Sort by the most recent inspection date (newest first)
+        items.sort(key=lambda x: x.get("last_inspected_at") or "", reverse=True)
+        
+        return jsonify(items), 200
+
+    except Exception as e:
+        current_app.logger.exception("Unified history failed")
+        return jsonify({"error": str(e)}), 500
+    
 @bp.route('/tilsyn/inspect', methods=['POST'])
 @limiter.limit("60 per minute")
 def unified_inspect():
@@ -501,61 +551,80 @@ def unified_inspect():
 
     data = request.get_json(force=True)
     item_id = data.get("id")
-    item_type = data.get("type")
     user_email = data.get("inspector_email")
     comment = data.get("comment")
-    inspected_at = data.get("inspected_at") or datetime.now(timezone.utc).isoformat()
+    selection = data.get("selection")
+    inspected_at = data.get("inspected_at") or datetime.now().isoformat()
+    updates = data.get("updates", {})  # Extract updates once
 
     if not item_id or not user_email:
         return jsonify({"error": "Missing required fields"}), 400
 
     container = get_unified_container()
+
     try:
         item = container.read_item(item=item_id, partition_key=item_id)
+        item_type = item.get("type")
 
-        item['last_inspected_at'] = inspected_at
-        item['last_inspector_email'] = user_email
-        item['inspection_comment'] = comment
+        # --- GLOBAL UPDATES (All types) ---
+        if "hidden" in updates:
+            item["hidden"] = updates["hidden"]
 
-        # Maintain History
-        if 'inspections' not in item or not isinstance(item['inspections'], list):
-            item['inspections'] = []
-        
-        item['inspections'].append({
+        item["last_inspected_at"] = inspected_at
+        item["last_inspector_email"] = user_email
+        item["inspection_comment"] = comment
+
+        history_record = {
             "inspected_at": inspected_at,
             "inspector_email": user_email,
-            "comment": comment
-        })
-
-        if item_type == "henstilling":
-            updates = data.get("updates", {})
-            if "kvadratmeter" in updates: item["Kvadratmeter"] = updates["kvadratmeter"]
-            if "slutdato" in updates: item["Slutdato"] = updates["slutdato"]
-            if "fakturaStatus" in updates: item["FakturaStatus"] = updates["fakturaStatus"]
-            
-            item.setdefault("AuditLog", []).append({
-                "timestamp": inspected_at, "user": user_email, "changes": updates
-            })
-
-        container.replace_item(item=item_id, body=item, if_match=item.get('_etag'))
-
-        queue_payload = {
-            "queue_name": "TilsynJournal",
-            "reference": item_id,
-            "data": data,  # Includes selection, comment, id, etc.
-            "created_by": user_email
+            "comment": comment,
+            "selection": selection,
         }
         
-        requests.post(
-            f"{request.host_url.rstrip('/')}/api/queue",
-            json=queue_payload,
-            headers={"X-API-Key": request.headers.get('X-API-Key')},
-            timeout=5
-        )
+        if "hidden" in updates:
+            history_record["hidden"] = updates["hidden"]
+
+        # --- TYPE SPECIFIC UPDATES ---
+        if item_type == "henstilling":
+            if "kvadratmeter" in updates:
+                item["Kvadratmeter"] = updates["kvadratmeter"]
+                history_record["kvadratmeter"] = updates["kvadratmeter"]
+
+            if "end_date" in updates:
+                item["end_date"] = updates["end_date"]
+                history_record["end_date"] = updates["end_date"]
+
+            if "fakturaStatus" in updates:
+                item["FakturaStatus"] = updates["fakturaStatus"]
+                history_record["faktura_status"] = updates["fakturaStatus"]
+
+        # Append to inspection history
+        if "inspections" not in item or not isinstance(item["inspections"], list):
+            item["inspections"] = []
+        item["inspections"].append(history_record)
+
+        container.replace_item(item=item_id, body=item, if_match=item.get("_etag"))
+
+        if item_type != "indmeldt":
+            # Queue for journalizing
+            requests.post(
+                f"{request.host_url.rstrip('/')}/api/queue",
+                json={
+                    "queue_name": "TilsynJournal",
+                    "reference": item_id,
+                    "data": data,
+                    "created_by": user_email
+                },
+                headers={"X-API-Key": api_key},
+                timeout=5
+            )
+
         return jsonify({"status": "success"}), 200
+
     except Exception as e:
         current_app.logger.exception(f"Unified inspect failed for {item_id}")
         return jsonify({"error": str(e)}), 500
+    
 
 @bp.route('/tilsyn/upload-image', methods=['POST'])
 @limiter.limit("100 per minute")
@@ -608,3 +677,135 @@ def upload_tilsyn_image():
     except Exception as e:
         current_app.logger.exception("Upload failed")
         return jsonify({"error": str(e)}), 500
+
+@bp.route('/tilsyn/indmeldt', methods=['POST'])
+@limiter.limit("30 per minute")
+def create_indmeldt_tilsyn():
+    """Create an ad-hoc ('indmeldt') tilsyn not tied to Vejman/PEZ.
+    The API assigns the case number server-side as YYYY-NNNN."""
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    full_address = (data.get("full_address") or "").strip()
+    street_name = (data.get("street_name") or "").strip()
+    title = (data.get("title") or "").strip()
+    description = (data.get("description") or "").strip()
+    created_by = (data.get("created_by") or "").strip()
+    created_by_source = (data.get("created_by_source") or "unknown").strip().lower()
+
+    if not full_address:
+        return jsonify({"error": "full_address is required"}), 400
+    if not title:
+        return jsonify({"error": "title is required"}), 400
+    if not created_by:
+        return jsonify({"error": "created_by is required"}), 400
+    if len(title) > 200:
+        return jsonify({"error": "title must be <= 200 characters"}), 400
+    if len(description) > 2000:
+        return jsonify({"error": "description must be <= 2000 characters"}), 400
+    if len(created_by) > 100:
+        return jsonify({"error": "created_by must be <= 100 characters"}), 400
+    if created_by_source not in ("app", "vejmankassen", "unknown"):
+        created_by_source = "unknown"
+
+    try:
+        latitude = float(data.get("latitude"))
+        longitude = float(data.get("longitude"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "latitude and longitude must be numbers"}), 400
+    if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
+        return jsonify({"error": "latitude/longitude out of range"}), 400
+
+    container = get_unified_container()
+    now = datetime.now()
+
+    try:
+        case_number = _generate_indmeldt_case_number(container, now.year)
+    except Exception:
+        current_app.logger.exception("Failed to generate indmeldt case number")
+        return jsonify({"error": "Could not generate case number"}), 500
+
+    item_id = f"ind_{uuid.uuid4()}"
+    new_item = {
+        "id": item_id,
+        "type": "indmeldt",
+        "case_number": case_number,
+        "full_address": full_address,
+        "street_name": street_name or None,
+        "latitude": latitude,
+        "longitude": longitude,
+        "title": title,
+        "description": description or None,
+        "created_by": created_by,
+        "created_by_source": created_by_source,
+        "created_at": now.isoformat(),
+        "hidden": False,
+        "inspections": [],
+        "last_inspected_at": None,
+        "last_inspector_email": None,
+        "inspection_comment": None,
+    }
+
+    try:
+        container.create_item(body=new_item)
+        return jsonify({
+            "status": "success",
+            "id": item_id,
+            "case_number": case_number,
+        }), 201
+    except Exception as e:
+        current_app.logger.exception(f"Failed to create indmeldt tilsyn {item_id}")
+        return jsonify({"error": str(e)}), 500
+    
+def _generate_indmeldt_case_number(container, year):
+    """Generate next YYYY-NNNN case number atomically via a counter doc
+    in the unified container (id=counter_indmeldt_YYYY, type=counter).
+    Counter docs are filtered out of /tilsyn/tasks (WHERE type clause)
+    and /tilsyn/history (inspections/hidden/FakturaStatus clauses)."""
+    counter_id = f"counter_indmeldt_{year}"
+    last_err = None
+    for _ in range(10):
+        counter = None
+        try:
+            counter = container.read_item(item=counter_id, partition_key=counter_id)
+        except CosmosHttpResponseError as e:
+            if e.status_code != 404:
+                raise
+
+        if counter is None:
+            # First indmeldt of the year - try to create the counter.
+            try:
+                container.create_item(body={
+                    "id": counter_id,
+                    "type": "counter",
+                    "value": 1,
+                })
+                return f"{year}-0001"
+            except CosmosHttpResponseError as e:
+                if e.status_code == 409:
+                    last_err = e
+                    continue
+                raise
+        else:
+            next_val = int(counter.get("value", 0)) + 1
+            counter["value"] = next_val
+            try:
+                container.replace_item(
+                    item=counter_id,
+                    body=counter,
+                    if_match=counter.get("_etag"),
+                )
+                return f"{year}-{next_val:04d}"
+            except CosmosHttpResponseError as e:
+                if e.status_code == 412:
+                    last_err = e
+                    continue
+                raise
+
+    raise RuntimeError(f"Could not generate indmeldt case number: {last_err}")
