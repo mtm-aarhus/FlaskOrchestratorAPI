@@ -409,8 +409,8 @@ def update_vejman_kassen():
 @bp.route("/tilsynapp/version", methods=["GET"])
 def get_app_version_info():
     return jsonify({
-        "min_version": 8,
-        "latest_version": 8,
+        "min_version": 9,
+        "latest_version": 11,
         "message": "Din app skal opdateres før du kan fortsætte. Gå ind i play store og søg efter nye opdateringer"
     })
 
