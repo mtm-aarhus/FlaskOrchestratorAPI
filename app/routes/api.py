@@ -9,12 +9,15 @@ from datetime import datetime, timezone, timedelta
 import logging
 import time
 import json
-from azure.cosmos import CosmosClient
+from azure.cosmos import CosmosClient, PartitionKey
 from azure.cosmos.exceptions import CosmosHttpResponseError
 from azure.storage.blob import BlobServiceClient
 import uuid
 import requests
-
+import hashlib
+import firebase_admin
+from firebase_admin import credentials, messaging
+import os
 bp = Blueprint('api', __name__, url_prefix='/api')
 
 # --- GLOBAL COSMOS CLIENTS ---
@@ -73,6 +76,13 @@ def init_api(app):
     container_unified = cosmos_db.get_container_client(app.config.get("COSMOS_COMBINED_CONTAINER"))
      # Initialize Azure Blob Client
     blob_service_client = BlobServiceClient.from_connection_string(app.config["AZURE_BLOB_CONNECTION"])
+    if not firebase_admin._apps:
+        cred_path = os.path.join(os.path.dirname(app.root_path), "aak-tilsyn-firebase-adminsdk-fbsvc-d79b0f2e3d.json")
+        cred_path = os.path.abspath(cred_path)
+        if os.path.isfile(cred_path):
+            firebase_admin.initialize_app(credentials.Certificate(cred_path))
+        else:
+            logging.warning(f"Service account missing at {cred_path} — push notifications disabled")
     
 def get_old_henstilling_container():
     return container_henstillinger_old
@@ -754,11 +764,16 @@ def create_indmeldt_tilsyn():
 
     try:
         container.create_item(body=new_item)
+        try:
+            _notify_new_indmeldt(container, new_item, created_by)
+        except Exception:
+            current_app.logger.exception("Push notification dispatch failed (item still created)")
         return jsonify({
             "status": "success",
             "id": item_id,
             "case_number": case_number,
         }), 201
+        
     except Exception as e:
         current_app.logger.exception(f"Failed to create indmeldt tilsyn {item_id}")
         return jsonify({"error": str(e)}), 500
@@ -809,3 +824,88 @@ def _generate_indmeldt_case_number(container, year):
                 raise
 
     raise RuntimeError(f"Could not generate indmeldt case number: {last_err}")
+
+@bp.route('/tilsyn/register-token', methods=['POST'])
+@limiter.limit("30 per minute")
+def register_fcm_token():
+    api_key = request.headers.get('X-API-Key')
+    if not safe_compare(api_key, current_app.config['API_KEY']):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    fcm_token = (data.get("fcm_token") or "").strip()
+    if not email or not fcm_token:
+        return jsonify({"error": "email and fcm_token required"}), 400
+
+    initials = email.split("@")[0].upper()
+    doc_id = f"fcm_{hashlib.sha256(fcm_token.encode()).hexdigest()[:32]}"
+
+    try:
+        get_unified_container().upsert_item({
+            "id": doc_id,
+            "type": "fcm_token",
+            "initials": initials,
+            "fcm_token": fcm_token,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        current_app.logger.exception("register_fcm_token failed")
+        return jsonify({"error": str(e)}), 500
+    
+def _notify_new_indmeldt(container, item, creator_initials):
+    """Push an FCM data-only message to every registered device except the creator's.
+    Payload contains only the case number + creator initials — never address/title/description."""
+    if not firebase_admin._apps:
+        return  # Firebase not configured
+
+    try:
+        tokens = [
+            t["fcm_token"]
+            for t in container.query_items(
+                query="SELECT c.fcm_token FROM c WHERE c.type='fcm_token' AND c.initials != @i",
+                parameters=[{"name": "@i", "value": creator_initials}],
+                enable_cross_partition_query=True,
+            )
+            if t.get("fcm_token")
+        ]
+    except Exception:
+        current_app.logger.exception("Failed to query fcm_tokens")
+        return
+
+    if not tokens:
+        return
+
+    data_payload = {
+        "item_id": str(item["id"]),
+        "case_number": str(item.get("case_number", "")),
+        "created_by_initials": str(creator_initials or ""),
+    }
+
+    # FCM caps multicast at 500 tokens per call.
+    for i in range(0, len(tokens), 500):
+        chunk = tokens[i:i + 500]
+        try:
+            response = messaging.send_each_for_multicast(
+                messaging.MulticastMessage(
+                    tokens=chunk,
+                    data=data_payload,
+                    android=messaging.AndroidConfig(priority="high"),
+                )
+            )
+            # Clean up tokens FCM says are dead.
+            for idx, resp in enumerate(response.responses):
+                if resp.success:
+                    continue
+                err = resp.exception
+                code = getattr(err, "code", "") if err else ""
+                if code in ("registration-token-not-registered", "invalid-argument"):
+                    dead_token = chunk[idx]
+                    dead_id = f"fcm_{hashlib.sha256(dead_token.encode()).hexdigest()[:32]}"
+                    try:
+                        container.delete_item(item=dead_id, partition_key=dead_id)
+                    except Exception:
+                        pass
+        except Exception:
+            current_app.logger.exception("FCM multicast failed")
