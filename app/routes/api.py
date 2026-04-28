@@ -445,8 +445,12 @@ def get_unified_tasks():
     now = datetime.now()
     today_str = now.date().isoformat()
 
+    # Start of current ISO week (Monday 00:00:00)
+    start_of_week = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
     try:
-        # 1. Fetch potentially active items (not explicitly hidden or finished)
         query = """
             SELECT * FROM c
             WHERE (c.hidden != true OR NOT IS_DEFINED(c.hidden))
@@ -461,6 +465,7 @@ def get_unified_tasks():
         items = list(container.query_items(query=query, enable_cross_partition_query=True))
 
         result = []
+        one_month_ago = now - timedelta(days=30)
 
         for item in items:
             item_type = item.get("type")
@@ -468,7 +473,14 @@ def get_unified_tasks():
             last_insp_dt = parse_iso_datetime(last_insp_str)
 
             if item_type == "henstilling":
-                # Only show if it hasn't been inspected yet today
+                # Skip if older than 1 month and never inspected
+                created_dt = parse_iso_datetime(
+                    item.get("start_date")
+                )
+                if not last_insp_dt and created_dt and created_dt < one_month_ago:
+                    continue
+
+                # Show if not inspected today
                 if not last_insp_str or not str(last_insp_str).startswith(today_str):
                     result.append(item)
 
@@ -484,21 +496,26 @@ def get_unified_tasks():
                 if not start_dt or not end_dt:
                     continue
 
-                # CASE A: Currently active permission
+                # CASE A: Currently active (Ny tilladelse)
+                # Show if no inspection has been registered in the current ISO week
                 if start_dt <= now <= end_dt:
                     item["vejman_display_state"] = "Ny tilladelse"
-                    # Show if not inspected today
-                    if not (last_insp_dt and last_insp_dt.date() == now.date()):
+                    inspected_this_week = last_insp_dt and last_insp_dt >= start_of_week
+                    if not inspected_this_week:
                         result.append(item)
 
-                # CASE B: Expired permission (needs a final check)
+                # CASE B: Expired (Færdig tilladelse)
+                # Show for up to 1 week after expiry, only if not yet inspected post-expiry
                 elif now > end_dt:
                     item["vejman_display_state"] = "Færdig tilladelse"
-                    # Show if it hasn't been inspected since it actually expired
-                    if not (last_insp_dt and last_insp_dt > end_dt):
-                        result.append(item)
+                    one_week_after_expiry = end_dt + timedelta(days=7)
 
-        # Sort by street name, then full address for better grouping on the device
+                    if now <= one_week_after_expiry:
+                        inspected_after_expiry = last_insp_dt and last_insp_dt > end_dt
+                        if not inspected_after_expiry:
+                            result.append(item)
+
+        # Sort by street name, then full address
         result.sort(key=lambda x: (
             (x.get("street_name") or "").strip().lower(),
             (x.get("full_address") or "").strip().lower(),
